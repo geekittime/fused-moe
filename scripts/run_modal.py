@@ -3,11 +3,6 @@ FlashInfer-Bench Modal Cloud Benchmark Runner.
 
 Automatically packs the solution from source files and runs benchmarks
 on NVIDIA B200 GPUs via Modal.
-
-Setup (one-time):
-    modal setup
-    modal volume create flashinfer-trace
-    modal volume put flashinfer-trace /path/to/flashinfer-trace/
 """
 
 import sys
@@ -23,46 +18,64 @@ from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
 app = modal.App("flashinfer-bench")
 
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
+flashinfer_cache_volume = modal.Volume.from_name("flashinfer-cache", create_if_missing=True)
 TRACE_SET_PATH = "/data"
+FLASHINFER_CACHE_PATH = "/root/.cache/flashinfer"
 
 image = (
     modal.Image.from_registry(
         "nvidia/cuda:12.8.0-devel-ubuntu22.04",
         add_python="3.12",
     )
-    .env({"CUDA_HOME": "/usr/local/cuda"})
+    .env({"CUDA_HOME": "/usr/local/cuda", "PYTHONUNBUFFERED": "1"})
     .apt_install("ninja-build")
     .pip_install("flashinfer-bench", "torch", "triton", "numpy", "apache-tvm-ffi")
 )
 
 
-@app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
+def _patch_persistent_runner_health_check():
+    """Avoid false health-check timeouts while keeping the official benchmark path."""
+    from flashinfer_bench.bench.runner import persistent_runner
+
+    def is_healthy(self):
+        return (
+            self._parent_conn is not None
+            and self._worker_proc is not None
+            and self._worker_proc.is_alive()
+            and not self._parent_conn.closed
+        )
+
+    persistent_runner.PersistentSubprocessWorker.is_healthy = is_healthy
+
+
+@app.function(
+    image=image,
+    gpu="B200:1",
+    timeout=3600,
+    volumes={
+        TRACE_SET_PATH: trace_volume,
+        FLASHINFER_CACHE_PATH: flashinfer_cache_volume,
+    },
+)
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
-        config = BenchmarkConfig(warmup_runs=5, iterations=10, num_trials=1)
-    # Clear build cache to avoid stale compiled kernels
-    import shutil, os
-    cache_dir = "/root/.cache/flashinfer_bench/cache"
-    if os.path.exists(cache_dir):
-        shutil.rmtree(cache_dir)
-        print("[DEBUG] Cleared build cache")
+        config = BenchmarkConfig(
+            warmup_runs=5,
+            iterations=10,
+            num_trials=1,
+            timeout_seconds=900,
+            use_isolated_runner=False,
+        )
 
-    # === Debug: Try to compile the solution first to get detailed error ===
-    try:
-        from flashinfer_bench.compile import BuilderRegistry
-        trace_set = TraceSet.from_path(TRACE_SET_PATH)
-        if solution.definition in trace_set.definitions:
-            definition = trace_set.definitions[solution.definition]
-            registry = BuilderRegistry.get_instance()
-            print("[DEBUG] Attempting to build solution...")
-            runnable = registry.build(definition, solution)
-            print(f"[DEBUG] Build succeeded! Runnable: {runnable}")
-    except Exception as e:
-        print(f"[DEBUG] Build failed with error:\n{e}")
-        import traceback
-        traceback.print_exc()
-    # === End debug ===
+    import logging
+    import os
+
+    logging.disable(logging.INFO)
+    logging.basicConfig(level=logging.WARNING, force=True)
+
+    _patch_persistent_runner_health_check()
+
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
 
     if solution.definition not in trace_set.definitions:
@@ -74,17 +87,12 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     if not workloads:
         raise ValueError(f"No workloads found for definition '{solution.definition}'")
 
-    # workloads = workloads[:10]
+    max_workloads = int(os.environ.get("FIB_MAX_WORKLOADS", "0"))
+    if max_workloads > 0:
+        workloads = workloads[:max_workloads]
 
-    # Only test FlashInfer baseline
-    # baseline_solutions = trace_set.solutions.get(solution.definition, [])
-    # print(f"Found {len(baseline_solutions)} baseline solution(s): {[s.name for s in baseline_solutions]}")
-    # all_solutions = baseline_solutions
-
-    # Test our solution
     all_solutions = [solution]
     print(f"Testing {len(all_solutions)} solution(s): {[s.name for s in all_solutions]}")
-
 
     bench_trace_set = TraceSet(
         root=trace_set.root,
@@ -95,7 +103,14 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     )
 
     benchmark = Benchmark(bench_trace_set, config)
-    result_trace_set = benchmark.run_all(dump_traces=True)
+    try:
+        result_trace_set = benchmark.run_all(dump_traces=True)
+    finally:
+        benchmark.close()
+        try:
+            flashinfer_cache_volume.commit()
+        except Exception:
+            pass
 
     traces = result_trace_set.traces.get(definition.name, [])
     results = {definition.name: {}}
@@ -104,7 +119,7 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
         if trace.evaluation:
             entry = {
                 "status": trace.evaluation.status.value,
-                "solution": trace.solution if isinstance(trace.solution, str) else getattr(trace, 'solution', ''),
+                "solution": trace.solution if isinstance(trace.solution, str) else getattr(trace, "solution", ""),
             }
             if trace.evaluation.performance:
                 entry["latency_ms"] = trace.evaluation.performance.latency_ms

@@ -6,3 +6,4 @@ author = "wby"              # Team/author name
 [build]
 language = "triton"                 # triton | cuda
 entry_point = "kernel.py::run"  # Triton export: file::function_name
+destination_passing_style = true
