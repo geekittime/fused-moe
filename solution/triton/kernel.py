@@ -14,9 +14,7 @@ NUM_H_BLOCKS = HIDDEN_SIZE // BLOCK_SIZE
 NUM_I_BLOCKS = INTERMEDIATE_SIZE // BLOCK_SIZE
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Fused GEMM1 + SwiGLU — all experts in ONE launch (no race on c_buf)
-# ═══════════════════════════════════════════════════════════════════════
+
 @triton.jit
 def _fused_moe_gemm1_swiglu_kernel(
     hs_ptr: tl.pointer_type(tl.float8e4nv),
@@ -103,9 +101,7 @@ def _fused_moe_gemm1_swiglu_kernel(
     tl.store(c_ptrs, c, mask=mask_m[:, None])
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Fused GEMM2 + accumulate — all experts, atomic_add avoids race
-# ═══════════════════════════════════════════════════════════════════════
+
 @triton.jit
 def _fused_moe_gemm2_accum_kernel(
     c_ptr: tl.pointer_type(tl.float32),
@@ -169,9 +165,7 @@ def _fused_moe_gemm2_accum_kernel(
     tl.atomic_add(out_ptrs, acc, mask=mask_m[:, None])
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Helpers
-# ═══════════════════════════════════════════════════════════════════════
+
 def _as_python_int(value) -> int:
     if isinstance(value, torch.Tensor):
         return int(value.item())
@@ -183,9 +177,6 @@ def _as_python_float(value) -> float:
     return float(value)
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Optimised run():  2 total kernel launches instead of 64
-# ═══════════════════════════════════════════════════════════════════════
 @torch.no_grad()
 def run(
     routing_logits: torch.Tensor,
@@ -207,7 +198,7 @@ def run(
     local_expert_offset = _as_python_int(local_expert_offset)
     routed_scaling_factor = _as_python_float(routed_scaling_factor)
 
-    # ── 1. Routing (identical to original) ───────────────────────────
+
     routing_logits = routing_logits.to(torch.float32).contiguous()
     if routing_bias is None:
         routing_bias_f32 = torch.zeros(
@@ -253,7 +244,7 @@ def run(
     )
     route_weights = route_weights * routed_scaling_factor
 
-    # ── 2. Batch token→expert assignment ─────────────────────────────
+
     local_end = local_expert_offset + local_num_experts
     local_mask = (topk_idx >= local_expert_offset) & (topk_idx < local_end)
 
@@ -271,7 +262,7 @@ def run(
     global_eids = topk_idx[tok_ids_flat, slot_ids_flat]
     local_eids = (global_eids - local_expert_offset).to(torch.int64)
 
-    # Sort by local expert so tokens per expert are contiguous
+
     sort_idx = torch.argsort(local_eids, stable=True)
     sorted_tok = tok_ids_flat[sort_idx].to(torch.int32).contiguous()
     sorted_local = local_eids[sort_idx]
@@ -283,14 +274,13 @@ def run(
         .contiguous()
     )
 
-    # Expert boundaries
+
     expert_counts = torch.bincount(sorted_local, minlength=local_num_experts)
     expert_starts = torch.zeros(
         local_num_experts + 1, dtype=torch.int64, device=device
     )
     torch.cumsum(expert_counts, dim=0, out=expert_starts[1:])
 
-    # ── 3. Build block metadata on CPU ───────────────────────────────
     ec_cpu = expert_counts.cpu()
     es_cpu = expert_starts.cpu()
 
@@ -318,7 +308,7 @@ def run(
     block_experts = torch.tensor(block_exp_list, dtype=torch.int32, device=device)
     block_counts  = torch.tensor(block_cnt_list, dtype=torch.int32, device=device)
 
-    # ── 4. Allocate intermediate buffer ONCE ─────────────────────────
+
     c_buf = torch.empty(
         (total_assignments, INTERMEDIATE_SIZE), dtype=torch.float32, device=device
     )
@@ -327,7 +317,7 @@ def run(
     BLOCK_I = BLOCK_SIZE
     BLOCK_N = BLOCK_SIZE
 
-    # ── 5. Fused GEMM1 + SwiGLU — ONE kernel launch ─────────────────
+
     grid_gemm1 = (n_blocks, NUM_I_BLOCKS)
     _fused_moe_gemm1_swiglu_kernel[grid_gemm1](
         hidden_states,
@@ -361,7 +351,7 @@ def run(
         num_stages=3,
     )
 
-    # ── 6. Fused GEMM2 + atomic accumulate — ONE kernel launch ───────
+
     grid_gemm2 = (n_blocks, NUM_H_BLOCKS)
     _fused_moe_gemm2_accum_kernel[grid_gemm2](
         c_buf,
