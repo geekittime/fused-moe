@@ -3,6 +3,11 @@ FlashInfer-Bench Modal Cloud Benchmark Runner.
 
 Automatically packs the solution from source files and runs benchmarks
 on NVIDIA B200 GPUs via Modal.
+
+Setup (one-time):
+    modal setup
+    modal volume create flashinfer-trace
+    modal volume put flashinfer-trace /path/to/flashinfer-trace/
 """
 
 import sys
@@ -18,63 +23,96 @@ from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
 app = modal.App("flashinfer-bench")
 
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
-flashinfer_cache_volume = modal.Volume.from_name("flashinfer-cache", create_if_missing=True)
 TRACE_SET_PATH = "/data"
-FLASHINFER_CACHE_PATH = "/root/.cache/flashinfer"
 
 image = (
     modal.Image.from_registry(
         "nvidia/cuda:12.8.0-devel-ubuntu22.04",
         add_python="3.12",
     )
-    .env({"CUDA_HOME": "/usr/local/cuda", "PYTHONUNBUFFERED": "1"})
+    .env({"CUDA_HOME": "/usr/local/cuda"})
     .apt_install("ninja-build")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy", "apache-tvm-ffi")
+    .pip_install(
+        "flashinfer-bench==0.1.2",
+        "flashinfer-python==0.3.1.post1",
+        "torch==2.11.0",
+        "triton",
+        "numpy",
+        "apache-tvm-ffi",
+    )
 )
 
 
-def _patch_persistent_runner_health_check():
-    """Avoid false health-check timeouts while keeping the official benchmark path."""
+def _extend_persistent_runner_health_check_timeout(timeout_seconds: float = 120.0):
+    """Keep the official GPU health check, but wait longer on busy Modal B200 workers."""
     from flashinfer_bench.bench.runner import persistent_runner
 
-    def is_healthy(self):
-        return (
-            self._parent_conn is not None
-            and self._worker_proc is not None
-            and self._worker_proc.is_alive()
-            and not self._parent_conn.closed
-        )
+    WorkerCommand = persistent_runner.WorkerCommand
+    WorkerResponse = persistent_runner.WorkerResponse
+
+    def is_healthy(self) -> bool:
+        if (
+            self._parent_conn is None
+            or self._worker_proc is None
+            or not self._worker_proc.is_alive()
+        ):
+            return False
+
+        if self._parent_conn.closed:
+            return False
+
+        try:
+            self._parent_conn.send({"cmd": WorkerCommand.HEALTH_CHECK.value})
+
+            if self._parent_conn.poll(timeout=timeout_seconds):
+                msg = self._parent_conn.recv()
+                return msg.get("cmd") == WorkerResponse.HEALTHY.value
+
+            print(
+                f"Health check timeout after {timeout_seconds:.0f}s on device {self._device}",
+                flush=True,
+            )
+            return False
+        except Exception as exc:
+            print(f"Health check failed on device {self._device}: {exc}", flush=True)
+            return False
 
     persistent_runner.PersistentSubprocessWorker.is_healthy = is_healthy
 
 
-@app.function(
-    image=image,
-    gpu="B200:1",
-    timeout=3600,
-    volumes={
-        TRACE_SET_PATH: trace_volume,
-        FLASHINFER_CACHE_PATH: flashinfer_cache_volume,
-    },
-)
+@app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
-        config = BenchmarkConfig(
-            warmup_runs=5,
-            iterations=10,
-            num_trials=1,
-            timeout_seconds=900,
-            use_isolated_runner=False,
-        )
+        config = BenchmarkConfig(warmup_runs=5, iterations=10, num_trials=1, timeout_seconds=900)
 
-    import logging
+    # Clear build cache to avoid stale compiled kernels between repeated Modal runs.
     import os
+    import shutil
 
-    logging.disable(logging.INFO)
-    logging.basicConfig(level=logging.WARNING, force=True)
+    _extend_persistent_runner_health_check_timeout()
 
-    _patch_persistent_runner_health_check()
+    cache_dir = "/root/.cache/flashinfer_bench/cache"
+    if os.path.exists(cache_dir):
+        shutil.rmtree(cache_dir)
+        print("[DEBUG] Cleared build cache")
+
+    # Try to compile once before benchmark so signature/build errors are visible.
+    try:
+        from flashinfer_bench.compile import BuilderRegistry
+
+        trace_set = TraceSet.from_path(TRACE_SET_PATH)
+        if solution.definition in trace_set.definitions:
+            definition = trace_set.definitions[solution.definition]
+            registry = BuilderRegistry.get_instance()
+            print("[DEBUG] Attempting to build solution...")
+            runnable = registry.build(definition, solution)
+            print(f"[DEBUG] Build succeeded! Runnable: {runnable}")
+    except Exception as e:
+        print(f"[DEBUG] Build failed with error:\n{e}")
+        import traceback
+
+        traceback.print_exc()
 
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
 
@@ -103,14 +141,7 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     )
 
     benchmark = Benchmark(bench_trace_set, config)
-    try:
-        result_trace_set = benchmark.run_all(dump_traces=True)
-    finally:
-        benchmark.close()
-        try:
-            flashinfer_cache_volume.commit()
-        except Exception:
-            pass
+    result_trace_set = benchmark.run_all(dump_traces=True)
 
     traces = result_trace_set.traces.get(definition.name, [])
     results = {definition.name: {}}
@@ -119,7 +150,9 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
         if trace.evaluation:
             entry = {
                 "status": trace.evaluation.status.value,
-                "solution": trace.solution if isinstance(trace.solution, str) else getattr(trace, "solution", ""),
+                "solution": trace.solution
+                if isinstance(trace.solution, str)
+                else getattr(trace, "solution", ""),
             }
             if trace.evaluation.performance:
                 entry["latency_ms"] = trace.evaluation.performance.latency_ms
