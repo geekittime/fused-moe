@@ -23,7 +23,9 @@ from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
 app = modal.App("flashinfer-bench")
 
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
+flashinfer_cache_volume = modal.Volume.from_name("flashinfer-cache", create_if_missing=True)
 TRACE_SET_PATH = "/data"
+FLASHINFER_CACHE_PATH = "/root/.cache/flashinfer"
 
 image = (
     modal.Image.from_registry(
@@ -34,7 +36,8 @@ image = (
     .apt_install("ninja-build")
     .pip_install(
         "flashinfer-bench==0.1.2",
-        "flashinfer-python==0.3.1.post1",
+        "flashinfer-python==0.6.7.post3",
+        "flashinfer-cubin==0.6.7.post3",
         "torch==2.11.0",
         "triton",
         "numpy",
@@ -80,7 +83,12 @@ def _extend_persistent_runner_health_check_timeout(timeout_seconds: float = 120.
     persistent_runner.PersistentSubprocessWorker.is_healthy = is_healthy
 
 
-@app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
+@app.function(
+    image=image,
+    gpu="B200:1",
+    timeout=3600,
+    volumes={TRACE_SET_PATH: trace_volume, FLASHINFER_CACHE_PATH: flashinfer_cache_volume},
+)
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
@@ -92,8 +100,13 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
 
     _extend_persistent_runner_health_check_timeout()
 
+    import flashinfer
+    import torch
+
+    print(f"[DEBUG] flashinfer={getattr(flashinfer, '__version__', 'unknown')}, torch={torch.__version__}")
+
     cache_dir = "/root/.cache/flashinfer_bench/cache"
-    if os.path.exists(cache_dir):
+    if os.environ.get("FIB_CLEAR_CACHE", "0") == "1" and os.path.exists(cache_dir):
         shutil.rmtree(cache_dir)
         print("[DEBUG] Cleared build cache")
 
@@ -161,6 +174,8 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
             if trace.evaluation.correctness:
                 entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
                 entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
+            if trace.evaluation.log:
+                entry["log"] = trace.evaluation.log.strip()
             results[definition.name][trace.workload.uuid] = entry
 
     return results
@@ -187,6 +202,8 @@ def print_results(results: dict):
                 print(f" | abs_err={abs_err:.2e}, rel_err={rel_err:.2e}", end="")
 
             print()
+            if result.get("log"):
+                print(result["log"][-2000:])
 
 
 @app.local_entrypoint()
