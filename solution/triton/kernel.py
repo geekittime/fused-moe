@@ -256,31 +256,29 @@ def run(
     expert_starts = torch.zeros(local_num_experts + 1, dtype=torch.int64, device=device)
     torch.cumsum(expert_counts, dim=0, out=expert_starts[1:])
 
-    counts_cpu = expert_counts.cpu()
-    starts_cpu = expert_starts.cpu()
-
     block_m = 64
-    block_offsets_list = []
-    block_experts_list = []
-    block_counts_list = []
-    for expert_id in range(local_num_experts):
-        count = int(counts_cpu[expert_id].item())
-        if count == 0:
-            continue
-        start = int(starts_cpu[expert_id].item())
-        for block_start in range(0, count, block_m):
-            block_offsets_list.append(start + block_start)
-            block_experts_list.append(expert_id)
-            block_counts_list.append(min(block_m, count - block_start))
-
-    n_blocks = len(block_offsets_list)
-    if n_blocks == 0:
+    blocks_per_expert = torch.div(
+        expert_counts + (block_m - 1),
+        block_m,
+        rounding_mode="floor",
+    )
+    max_blocks = int(blocks_per_expert.max().item())
+    if max_blocks == 0:
         output.copy_(out_accum.to(output.dtype))
         return
 
-    block_offsets = torch.tensor(block_offsets_list, dtype=torch.int32, device=device)
-    block_experts = torch.tensor(block_experts_list, dtype=torch.int32, device=device)
-    block_counts = torch.tensor(block_counts_list, dtype=torch.int32, device=device)
+    expert_grid = torch.arange(local_num_experts, device=device, dtype=torch.int64)[:, None]
+    block_grid = torch.arange(max_blocks, device=device, dtype=torch.int64)[None, :]
+    valid_blocks = block_grid < blocks_per_expert[:, None]
+    block_experts_i64 = expert_grid.expand(-1, max_blocks)[valid_blocks]
+    block_ids_i64 = block_grid.expand(local_num_experts, -1)[valid_blocks]
+    block_offsets = (expert_starts[block_experts_i64] + block_ids_i64 * block_m).to(torch.int32)
+    block_counts = torch.minimum(
+        expert_counts[block_experts_i64] - block_ids_i64 * block_m,
+        torch.full_like(block_ids_i64, block_m),
+    ).to(torch.int32)
+    block_experts = block_experts_i64.to(torch.int32)
+    n_blocks = int(block_experts.numel())
     c_buf = torch.empty((total_assignments, INTERMEDIATE_SIZE), dtype=torch.float32, device=device)
 
     grid_gemm1 = (n_blocks, NUM_I_BLOCKS)
