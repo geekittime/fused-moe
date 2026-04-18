@@ -72,7 +72,6 @@ def _moe_gemm1_swiglu_kernel(
             mask=mask_m,
             other=0.0,
         )
-        a = a * a_scale[:, None]
 
         w1_ptrs = w13_base + offs_i[:, None] * stride_w13_o + offs_k[None, :] * stride_w13_h
         w2_ptrs = (
@@ -87,8 +86,8 @@ def _moe_gemm1_swiglu_kernel(
             s13_base + (NUM_I_BLOCKS_C + pid_i) * stride_s13_o + kb * stride_s13_hb
         )
 
-        u1 += tl.dot(a, tl.trans(w1 * s1))
-        u2 += tl.dot(a, tl.trans(w2 * s2))
+        u1 += tl.dot(a, tl.trans(w1)) * (a_scale[:, None] * s1)
+        u2 += tl.dot(a, tl.trans(w2)) * (a_scale[:, None] * s2)
 
     silu_u2 = u2 / (1.0 + tl.exp(-u2))
     c = silu_u2 * u1
@@ -150,7 +149,7 @@ def _moe_gemm2_accum_kernel(
         w_ptrs = w2_base + offs_h[:, None] * stride_w2_h + offs_i[None, :] * stride_w2_i
         w = tl.load(w_ptrs).to(tl.float32)
         scale = tl.load(s2_base + pid_h * stride_s2_hb + ib * stride_s2_ib)
-        acc += tl.dot(c, tl.trans(w * scale))
+        acc += tl.dot(c, tl.trans(w)) * scale
 
     acc = acc * w_tok[:, None]
     out_ptrs = out_ptr + tok_idx[:, None] * stride_out_t + offs_h[None, :] * stride_out_h
